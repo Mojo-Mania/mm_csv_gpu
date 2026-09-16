@@ -38,7 +38,7 @@ the same scan takes 27.4 ms, and the CPU next to it parses the same bytes in
 
 **On Apple silicon, reuse the scanner, or most of the win goes to the
 allocator.** A fresh pinned host buffer the size of the document costs 4.5 ms
-to allocate and 22.5 ms to fault in on first touch, against 3.5 ms for all
+to allocate and 22.5 ms to fault in on first touch, against 2.3 ms for all
 five kernels. So `GpuCsvTable`, which allocates per document, runs the 253 MB
 file in 40 ms, and a `GpuCsvScanner` that already owns its buffers runs it in
 **18.5 ms**. On the RTX 4050 under Linux the two are within 2% of each other,
@@ -68,7 +68,7 @@ into a pinned index took a full second.
 
 **What limits the speed depends on the machine.** On the M4 Max it is
 reading the file: 13.4 ms of the 18.5 is `FileHandle.read`, and everything on
-the device together is 5.3. On the RTX 4050 it is the PCIe link: the upload
+the device together is 4.1. On the RTX 4050 it is the PCIe link: the upload
 alone is 18.8 ms of the 27.4, and all five kernels together are 4.6.
 
 ## How it works
@@ -155,9 +155,9 @@ it overlaps the read with the upload in 16 MiB slices.
 | **reused `GpuCsvScanner`** | **18.5** | **12.76** | **0.82** |
 | read into pinned memory | 13.4 | 17.6 | 0.60 |
 | upload | 1.3 | **187.7** | 0.06 |
-| analyse | 1.2 | **202.2** | 0.05 |
-| one prefix scan (of two) | 0.6 | **375.2** | 0.03 |
-| emit | 1.1 | **219.6** | 0.05 |
+| analyse | 0.8 | **313.7** | 0.03 |
+| one prefix scan (of two) | 0.4 | **555.7** | 0.02 |
+| emit | 0.7 | **354.8** | 0.03 |
 | index back | 0.5 | **512.2** | 0.02 |
 | — mm_csv, CPU, parse only | 24.4 | 9.66 | 1.09 |
 
@@ -170,9 +170,9 @@ one quoted field containing a comma in every row:
 | **reused `GpuCsvScanner`** | **18.1** | **14.04** | **0.82** |
 | read into pinned memory | 13.4 | 18.9 | 0.61 |
 | upload | 1.3 | **191.3** | 0.06 |
-| analyse | 0.9 | **279.5** | 0.04 |
-| one prefix scan (of two) | 0.4 | **567.1** | 0.02 |
-| emit | 0.9 | **288.4** | 0.04 |
+| analyse | 0.8 | **318.9** | 0.04 |
+| one prefix scan (of two) | 0.5 | **562.1** | 0.02 |
+| emit | 0.7 | **342.1** | 0.03 |
 | index back | 0.5 | **562.1** | 0.02 |
 | — mm_csv, CPU, parse only | 24.5 | 10.3 | 1.12 |
 
@@ -185,10 +185,10 @@ one quoted field containing a comma in every row:
 | — mm_csv, CPU, parse only | **2.2** | **9.42** |
 
 **The device work is small and scales well.** On the 253 MB document analyse
-and emit each read the whole thing at over 200 GiB/s and the two scans cost
-1.2 ms between them: 3.5 ms of kernels, against 24.4 ms for the CPU
+and emit each read the whole thing at over 300 GiB/s and the two scans cost
+0.8 ms between them: 2.3 ms of kernels, against 24.4 ms for the CPU
 library to parse the same document. Add the upload and the index download and
-the device side is 5.3 ms.
+the device side is 4.1 ms.
 
 **Allocation was three quarters of the one-shot cost**, and reusing a scanner
 removes it: 58.8 ms to 18.5. That is the single largest thing in this
@@ -258,11 +258,11 @@ well under their sum.
 measurement on this card had analyse at 7.8 ms and emit at 9.0, 25-30 GiB/s
 against 200-220 on the M4 Max. NVIDIA's backend does not keep `SIMD` vectors
 as vectors: a 16-byte load becomes a loop inserting one byte at a time, and
-every compare is split into scalars. On non-Apple devices the chunk is now
-read as eight 64-bit words with SWAR compares, which took analyse to 1.6 ms
-and emit to 2.4, the whole scan from 46.4 ms to 33.2, and changed no index
-entry. Apple keeps the `SIMD` version, which is what it was measured
-with.
+every compare is split into scalars. The chunk is now read as eight 64-bit
+words with SWAR compares, which took analyse to 1.6 ms and emit to 2.4, the
+whole scan from 46.4 ms to 33.2, and changed no index entry. The words are
+faster on the M4 Max too -- analyse by about 15%, emit by 25-30% -- so every
+device reads them.
 
 **The download now overlaps the upload.** PCIe carries both directions at
 once, but only between buffers created on different streams: MAX makes a

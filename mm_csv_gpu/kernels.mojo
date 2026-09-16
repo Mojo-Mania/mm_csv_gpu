@@ -37,7 +37,6 @@ from max.gpu import barrier, block_dim, block_idx, thread_idx
 from max.gpu.memory import AddressSpace
 from std.bit import count_trailing_zeros, pop_count
 from std.memory import stack_allocation
-from std.sys.info import is_apple_gpu
 
 comptime QUOTE = UInt8(ord('"'))
 comptime LF = UInt8(ord("\n"))
@@ -57,34 +56,6 @@ comptime CRLF_BIT = UInt32(1) << 31
 comptime OFFSET_MASK = (UInt32(1) << 31) - 1
 """Written out rather than as `UInt32.MAX >> 1`; see the CPU package for what
 `Int(UInt32.MAX)` does."""
-
-comptime _WEIGHTS = SIMD[DType.uint16, 16](
-    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768
-)
-
-
-@always_inline
-def _movemask(
-    m0: SIMD[DType.bool, 16],
-    m1: SIMD[DType.bool, 16],
-    m2: SIMD[DType.bool, 16],
-    m3: SIMD[DType.bool, 16],
-) -> UInt64:
-    """Packs sixty-four lane flags into a `UInt64`, one bit each.
-
-    `std.memory.pack_bits` is what the CPU package uses and it cannot be used
-    here: Metal's shader compiler does not survive it -- the pipeline build
-    fails with `XPC_ERROR_CONNECTION_INTERRUPTED` rather than a diagnostic.
-    Multiplying the comparison result by the bit weights and reducing gives
-    the same integer in four operations instead of sixteen shifts.
-    """
-    return (
-        UInt64((m0.cast[DType.uint16]() * _WEIGHTS).reduce_add())
-        | (UInt64((m1.cast[DType.uint16]() * _WEIGHTS).reduce_add()) << 16)
-        | (UInt64((m2.cast[DType.uint16]() * _WEIGHTS).reduce_add()) << 32)
-        | (UInt64((m3.cast[DType.uint16]() * _WEIGHTS).reduce_add()) << 48)
-    )
-
 
 comptime _ONES = UInt64(0x0101010101010101)
 comptime _LOW7 = UInt64(0x7F7F7F7F7F7F7F7F)
@@ -170,43 +141,23 @@ def chunk_masks[
     var lfs = UInt64(0)
     var crs = UInt64(0)
 
-    # Two ways of reading the same sixty-four bytes, chosen per device. The
-    # `SIMD` version runs analyse at 200 GiB/s on an M4 Max. On NVIDIA it runs
-    # at 25: the backend emits each 16-byte load as a loop inserting one byte
-    # at a time, and splits every compare into scalars. Eight 64-bit words
-    # took analyse on an RTX 4050 from 9.8 ms to 1.9, same output, checked
-    # entry for entry. The word version has not been measured on Metal, so
-    # Apple keeps the one that was.
-    comptime if is_apple_gpu():
-        var quote_v = SIMD[DType.uint8, 16](QUOTE)
-        var sep_v = SIMD[DType.uint8, 16](separator)
-        var lf_v = SIMD[DType.uint8, 16](LF)
-        var cr_v = SIMD[DType.uint8, 16](CR)
-
-        var b0 = data.unsafe_offset(base).unsafe_load[width=16]()
-        var b1 = data.unsafe_offset(base + 16).unsafe_load[width=16]()
-        var b2 = data.unsafe_offset(base + 32).unsafe_load[width=16]()
-        var b3 = data.unsafe_offset(base + 48).unsafe_load[width=16]()
-
-        quotes = _movemask(
-            b0.eq(quote_v), b1.eq(quote_v), b2.eq(quote_v), b3.eq(quote_v)
-        )
-        seps = _movemask(b0.eq(sep_v), b1.eq(sep_v), b2.eq(sep_v), b3.eq(sep_v))
-        lfs = _movemask(b0.eq(lf_v), b1.eq(lf_v), b2.eq(lf_v), b3.eq(lf_v))
-        crs = _movemask(b0.eq(cr_v), b1.eq(cr_v), b2.eq(cr_v), b3.eq(cr_v))
-    else:
-        var quote_p = _ONES * UInt64(QUOTE)
-        var sep_p = _ONES * UInt64(separator)
-        var lf_p = _ONES * UInt64(LF)
-        var cr_p = _ONES * UInt64(CR)
-        var words = data.unsafe_offset(base).unsafe_bitcast[UInt64]()
-        for j in range(8):
-            var word = words[unsafe_offset=j]
-            var shift = UInt64(8 * j)
-            quotes |= _equal_bytes(word, quote_p) << shift
-            seps |= _equal_bytes(word, sep_p) << shift
-            lfs |= _equal_bytes(word, lf_p) << shift
-            crs |= _equal_bytes(word, cr_p) << shift
+    # Eight 64-bit words, not four 16-byte vectors. NVIDIA's backend turns each
+    # 16-byte load into a loop inserting one byte at a time and splits every
+    # compare into scalars; the words took analyse on an RTX 4050 from 9.8 ms
+    # to 1.9. On an M4 Max they are faster too, analyse by about 15% and emit
+    # by 25-30%, so every device reads them.
+    var quote_p = _ONES * UInt64(QUOTE)
+    var sep_p = _ONES * UInt64(separator)
+    var lf_p = _ONES * UInt64(LF)
+    var cr_p = _ONES * UInt64(CR)
+    var words = data.unsafe_offset(base).unsafe_bitcast[UInt64]()
+    for j in range(8):
+        var word = words[unsafe_offset=j]
+        var shift = UInt64(8 * j)
+        quotes |= _equal_bytes(word, quote_p) << shift
+        seps |= _equal_bytes(word, sep_p) << shift
+        lfs |= _equal_bytes(word, lf_p) << shift
+        crs |= _equal_bytes(word, cr_p) << shift
 
     # The CR that pairs with a line feed in lane zero is the last byte of the
     # previous chunk, and reading it from the document is why no carry is

@@ -105,7 +105,8 @@ one: a benchmark that does not verify its answer is measuring something else.
 the movemask. Metal's shader compiler does not survive it: the pipeline build
 fails with `XPC_ERROR_CONNECTION_INTERRUPTED` and no diagnostic. Multiplying
 the comparison result by bit weights and reducing gives the same integer in
-four operations and compiles fine.
+four operations and compiles fine. (That movemask is gone too now: the chunk
+is read as SWAR words -- see "On a discrete card" below.)
 
 **Storing the chunk masks instead of recomputing them.** Three `UInt64` per 64
 bytes is 0.375x the document in extra memory to save one re-read at 200 GiB/s.
@@ -185,7 +186,7 @@ honest reason to have it is the 2 GiB column rather than the 253 MB one.
 First measured on a laptop RTX 4050 (PCIe 4.0 x8, CUDA 13.3, Linux) next to an
 AMD Ryzen AI 9 HX 370. All tests pass there.
 
-### Done: read the chunk as words, not vectors, off Apple
+### Done: read the chunk as words, not vectors
 
 The first run had analyse at 7.8 ms and emit at 9.0 on the 253 MB document --
 25-30 GiB/s, against 200-220 on the M4 Max -- while the prefix scan on the
@@ -197,13 +198,11 @@ vectors as vectors. `unsafe_load[width=16]` becomes a sixteen-iteration loop
 of `insertelement`, four of them per chunk, and the compares and weighted
 reduces come out as scalars: about 950 lines of NVPTX assembly per chunk.
 
-On non-Apple devices `chunk_masks` now loads eight `UInt64` words and finds
-each byte class with the exact SWAR equality -- XOR, add `0x7F` to the low
-seven bits, keep the high bits that stayed clear -- and a multiply that
-gathers the eight flags into one byte. Selected with
-`comptime if is_apple_gpu()`, which is resolved for the device inside a
-kernel. Measured in isolation, same buffers, same process, outputs compared
-entry for entry:
+`chunk_masks` now loads eight `UInt64` words and finds each byte class with
+the exact SWAR equality -- XOR, add `0x7F` to the low seven bits, keep the high
+bits that stayed clear -- and a multiply that gathers the eight flags into one
+byte. Measured in isolation, same buffers, same process, outputs compared entry
+for entry:
 
 | `large.csv` | `SIMD` | SWAR |
 | --- | ---: | ---: |
@@ -213,9 +212,27 @@ entry for entry:
 End to end, 46.4 ms to **33.2** on `large.csv` and 5.4 to 4.1 on `small.csv`.
 Breaking the SWAR equality fails ten of the eleven tests, so they do run it.
 
-**Not measured on Metal.** Apple keeps the `SIMD` version because that is what
-its 200 GiB/s was measured with. The word version may well be as fast there
-or faster; that is one run on the M4 Max away.
+**Faster on Metal too, so it is the only version.** This first went in behind
+`comptime if is_apple_gpu()`, with Apple keeping `SIMD` because that is what
+its 200 GiB/s had been measured with. On the M4 Max, the two builds differing
+only in that branch, alternated, three runs each at best of 100 instead of the
+benchmark's five -- at five the kernel rows jump between two levels:
+
+| GiB/s | `SIMD` | SWAR |
+| --- | ---: | ---: |
+| `large.csv` analyse | 277-291 | **314-340** |
+| `large.csv` emit | 275-288 | **336-364** |
+| `quoted.csv` analyse | 281-283 | **322-345** |
+| `quoted.csv` emit | 279-281 | **362-385** |
+| `large.csv` one prefix scan | 531-576 | 526-583 |
+
+The prefix scan does not read the document and is the control. All 12 tests
+pass with the words on Metal, and `metal:4`, `metal:1`, `sm_80` and `gfx942`
+still compile. The reused scan does not move -- 17.0-17.2 ms against
+17.0-17.3 on `large.csv` -- because about 0.3 ms of kernels is lost in a
+13 ms file read. It is kept anyway: one path instead of two, and no device
+where it is slower. The `SIMD` version and the weighted-reduce movemask it
+needed are gone.
 
 ### Tried: letting kernels touch pinned host memory
 
