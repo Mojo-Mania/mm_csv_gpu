@@ -1,6 +1,23 @@
 # Identified improvements
 
-## The allocation is the whole cost, and it is avoidable
+## Done: the allocation was the whole cost
+
+`GpuCsvScanner` keeps its buffers and rescans through them. On the 253 MB
+document that is **58.8 ms to 18.6**, and on 23 MB 6.1 to 2.3. The estimate
+below said "near 19" before the type existed, which is the one time in this
+repository's history a prediction has come out right.
+
+The buffers grow when a document does not fit and never shrink, so a scanner
+settles at the size of the largest document it has seen. `capacity` in the
+constructor allocates and touches the pinned pages up front, so the first
+`scan` is as cheap as the second. Fields borrow the scanner's own memory and
+are invalid after the next `scan` -- that is the bargain, and `GpuCsvTable`
+still exists for callers who would rather not take it.
+
+What is left of the 18.6 ms is 13.3 of file read and 4.4 of device work. The
+next section was the reasoning; the one after it is where the time went next.
+
+## The allocation was the whole cost, and this is why
 
 On `large.csv` — 253 MB — the total is 60.6 ms and the parts that do work add
 up to about 18.7:

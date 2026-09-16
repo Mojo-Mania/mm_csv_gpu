@@ -12,7 +12,7 @@ blocks, and across tiles of blocks.
 """
 
 from max.gpu.host import DeviceContext
-from mm_csv_gpu import GpuCsvTable
+from mm_csv_gpu import GpuCsvScanner, GpuCsvTable
 from mm_csv_gpu.kernels import CR, CRLF_BIT, LF, OFFSET_MASK, QUOTE
 from std.pathlib import Path
 from std.testing import TestSuite, assert_equal, assert_true
@@ -46,19 +46,25 @@ def _reference(text: String, separator: UInt8) -> List[UInt32]:
 
 def _assert_matches(
     ctx: DeviceContext,
+    mut scanner: GpuCsvScanner,
     text: String,
     context: String,
     separator: UInt8 = UInt8(ord(",")),
 ) raises:
-    """Writes `text`, scans it on the GPU, and compares every entry."""
+    """Writes `text`, scans it on the GPU, and compares every entry.
+
+    The scanner is passed in rather than built here, so a test sweeping two
+    hundred documents sweeps them through one set of buffers -- which is what
+    the type is for, and makes the sweeps a test of that reuse as well.
+    """
     with open(SCRATCH, "w") as f:
         f.write(text)
     var expected = _reference(text, separator)
-    var table = GpuCsvTable(ctx, Path(SCRATCH))
-    assert_equal(len(table), len(expected), String(context, ": field count"))
+    scanner.scan(ctx, Path(SCRATCH))
+    assert_equal(len(scanner), len(expected), String(context, ": field count"))
     for i in range(len(expected)):
         assert_equal(
-            Int(table._index[i]),
+            Int(scanner._index[i]),
             Int(expected[i]),
             String(context, ": entry ", i),
         )
@@ -66,14 +72,19 @@ def _assert_matches(
 
 def test_rfc_shapes() raises:
     var ctx = DeviceContext()
-    _assert_matches(ctx, "aaa,bbb,ccc\r\nzzz,yyy,xxx\r\n", "CRLF rows")
-    _assert_matches(ctx, "aaa,bbb,ccc\r\nzzz,yyy,xxx", "no trailing break")
-    _assert_matches(ctx, "a,b\nc,d\n", "bare LF")
-    _assert_matches(ctx, 'a,"b,c",d\r\n', "separator inside quotes")
-    _assert_matches(ctx, 'a,"line\r\nbreak",c\r\n', "break inside quotes")
-    _assert_matches(ctx, 'a,"he said ""hi""",c\r\n', "doubled quote")
-    _assert_matches(ctx, ",,\r\n,,\r\n", "empty fields")
-    _assert_matches(ctx, "é,ü\r\nnaïve,日本\r\n", "non-ASCII")
+    var scanner = GpuCsvScanner(ctx)
+    _assert_matches(ctx, scanner, "aaa,bbb,ccc\r\nzzz,yyy,xxx\r\n", "CRLF rows")
+    _assert_matches(
+        ctx, scanner, "aaa,bbb,ccc\r\nzzz,yyy,xxx", "no trailing break"
+    )
+    _assert_matches(ctx, scanner, "a,b\nc,d\n", "bare LF")
+    _assert_matches(ctx, scanner, 'a,"b,c",d\r\n', "separator inside quotes")
+    _assert_matches(
+        ctx, scanner, 'a,"line\r\nbreak",c\r\n', "break inside quotes"
+    )
+    _assert_matches(ctx, scanner, 'a,"he said ""hi""",c\r\n', "doubled quote")
+    _assert_matches(ctx, scanner, ",,\r\n,,\r\n", "empty fields")
+    _assert_matches(ctx, scanner, "é,ü\r\nnaïve,日本\r\n", "non-ASCII")
 
 
 def test_empty_document() raises:
@@ -88,10 +99,14 @@ def test_empty_document() raises:
 def test_every_length() raises:
     """Each tail alignment, which is the lane mask in `chunk_masks`."""
     var ctx = DeviceContext()
+    var scanner = GpuCsvScanner(ctx)
     var text = String()
     for i in range(200):
         _assert_matches(
-            ctx, String(text, "z"), String("length ", text.byte_length() + 1)
+            ctx,
+            scanner,
+            String(text, "z"),
+            String("length ", text.byte_length() + 1),
         )
         text += "a,b\r\n" if i % 7 == 6 else "q"
 
@@ -100,6 +115,7 @@ def test_quotes_across_chunks() raises:
     """The carry the whole design exists for: a quoted region spanning
     chunks, walked across every lane of the boundary."""
     var ctx = DeviceContext()
+    var scanner = GpuCsvScanner(ctx)
     var trailer = String()
     for _ in range(20):
         trailer += "e,f,g\r\n"
@@ -109,6 +125,7 @@ def test_quotes_across_chunks() raises:
             filler += "y"
         _assert_matches(
             ctx,
+            scanner,
             String('a,"', filler, ',still one field",c\r\n', trailer),
             String("quote pad ", pad),
         )
@@ -121,6 +138,7 @@ def test_crlf_across_chunks() raises:
     so this is the test that the read is there and correct.
     """
     var ctx = DeviceContext()
+    var scanner = GpuCsvScanner(ctx)
     var trailer = String()
     for _ in range(20):
         trailer += "c,d\r\n"
@@ -130,6 +148,7 @@ def test_crlf_across_chunks() raises:
             filler += "x"
         _assert_matches(
             ctx,
+            scanner,
             String(filler, ",b\r\n", trailer),
             String("CRLF pad ", pad),
         )
@@ -141,7 +160,8 @@ def test_across_blocks() raises:
     var text = String()
     for i in range(4000):
         text += "aaa,bbb,ccc\r\n" if i % 3 != 0 else 'aaa,"b,b",ccc\r\n'
-    _assert_matches(ctx, text, "4000 rows, many blocks")
+    var scanner = GpuCsvScanner(ctx)
+    _assert_matches(ctx, scanner, text, "4000 rows, many blocks")
 
 
 def test_across_scan_tiles() raises:
@@ -158,13 +178,17 @@ def test_across_scan_tiles() raises:
         text.byte_length() > 4 * 1024 * 1024,
         "the document has to be large enough to tile the totals scan",
     )
-    _assert_matches(ctx, text, "5 MB, many tiles of blocks")
+    var scanner = GpuCsvScanner(ctx)
+    _assert_matches(ctx, scanner, text, "5 MB, many tiles of blocks")
 
 
 def test_unterminated_quote() raises:
     """A quote that never closes: every delimiter after it is data."""
     var ctx = DeviceContext()
-    _assert_matches(ctx, 'a,b\r\n"c,d\r\ne,f\r\n', "unterminated quote")
+    var scanner = GpuCsvScanner(ctx)
+    _assert_matches(
+        ctx, scanner, 'a,b\r\n"c,d\r\ne,f\r\n', "unterminated quote"
+    )
 
 
 def test_custom_separator() raises:

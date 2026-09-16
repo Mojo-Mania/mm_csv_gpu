@@ -13,6 +13,15 @@ print(table.row_count(), table.column_count)
 print(table.field(1, 3))            # borrowed, nothing copied
 ```
 
+Scanning more than one document? Keep the buffers:
+
+```mojo
+var scanner = GpuCsvScanner(ctx, capacity=512 << 20)
+for path in paths:
+    scanner.scan(ctx, path)
+    print(len(scanner), "fields in", path)
+```
+
 This is the GPU counterpart to [mm_csv](https://github.com/Mojo-Mania/mm_csv),
 the way [mm_radix_sort_gpu](https://github.com/Mojo-Mania/mm_radix_sort_gpu) is
 to mm_radix_sort. It produces the same index — one `UInt32` per field holding
@@ -21,14 +30,17 @@ was an LF preceded by a CR.
 
 ## Read this before reaching for it
 
-**The scan is fast and the surrounding work is not.** On a 253 MB document the
-three kernels take 3.5 ms between them, which is 72 GiB/s against the CPU
-library's 9.4. Getting to and from them takes another 57 ms, almost all of it
-allocating a pinned host buffer the size of the document and faulting its pages
-in on first touch. **End to end, one-shot, this currently loses to the CPU.**
-The numbers are below and the reason is in
-[`docs/improvements.md`](docs/improvements.md), along with the fix, which is to
-stop allocating per parse.
+**Reuse the scanner, or most of the win goes to the allocator.** A fresh
+pinned host buffer the size of the document costs 4.5 ms to allocate and
+22.5 ms to fault in on first touch -- against 2.6 ms for all five kernels. So
+`GpuCsvTable`, which allocates per document, runs a 253 MB file in 58.8 ms,
+and a `GpuCsvScanner` that already owns its buffers runs the same file in
+**18.6 ms**. Use the scanner for anything but a one-off.
+
+**Size matters more than usual.** At 23 MB a warm scan is 2.3 ms against the
+CPU library's 2.2 -- a wash. At 253 MB it is 18.6 ms against about 25 plus the
+CPU's own file read. The fixed costs are large and the marginal cost is tiny,
+so the crossover is somewhere in the tens of megabytes.
 
 **Unified memory is doing a lot of work here.** These numbers are Apple silicon,
 where the upload is a 185 GiB/s copy between two regions of the same RAM. On a
@@ -37,6 +49,10 @@ discrete card the document crosses PCIe and the arithmetic is different.
 **A kernel cannot read a pinned host buffer.** It reads zeros, silently, and a
 timing taken that way looks wonderful. The pinned buffer here is a *source* for
 the upload, which is what makes the upload 185 GiB/s instead of 6.
+
+**Reading the file is now the bottleneck.** 13.3 ms of the 18.6 is
+`FileHandle.read`, at 17.7 GiB/s. Everything on the device put together is
+4.4. Making this faster is a file-I/O problem, not a GPU one.
 
 ## How it works
 
@@ -75,7 +91,9 @@ mm_csv_gpu = { git = "https://github.com/Mojo-Mania/mm_csv_gpu.git" }
 
 | | |
 | --- | --- |
-| `GpuCsvTable[separator](ctx, path)` | Reads and scans `path`. |
+| `GpuCsvScanner[separator](ctx, capacity=0)` | A reusable scanner. Size it now or pay on first scan. |
+| `.scan(ctx, path)` | Scans `path`, replacing what was there. |
+| `GpuCsvTable[separator](ctx, path)` | One document, own buffers. Convenience over the above. |
 | `.column_count` | Fields in the first row. |
 | `.row_count()` | Rows. |
 | `len(table)` | Fields, in total. |
@@ -100,34 +118,37 @@ reimplementation here.
 
 | | ms | GiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| **total, file to index** | **60.6** | 3.89 | 2.70 |
-| read into pinned memory | 13.4 | 17.6 | 0.60 |
-| upload | 1.3 | **184.9** | 0.06 |
-| analyse | 1.2 | **192.5** | 0.05 |
-| one prefix scan (of two) | 0.6 | **376.4** | 0.03 |
-| emit | 1.1 | **222.7** | 0.05 |
-| index back | 0.5 | **522.4** | 0.02 |
+| one-shot `GpuCsvTable` | 58.8 | 4.01 | 2.62 |
+| **reused `GpuCsvScanner`** | **18.6** | **12.64** | **0.83** |
+| read into pinned memory | 13.3 | 17.7 | 0.59 |
+| upload | 1.3 | **184.8** | 0.06 |
+| analyse | 0.8 | **281.1** | 0.04 |
+| one prefix scan (of two) | 0.5 | **462.9** | 0.02 |
+| emit | 0.8 | **285.9** | 0.04 |
+| index back | 0.5 | **502.3** | 0.02 |
 
 **`small.csv`** — 23 MB, 255 361 rows, 8 columns, 2 042 888 fields:
 
 | | ms | GiB/s |
 | --- | ---: | ---: |
-| total, file to index | 6.3 | 3.42 |
-| the five kernels together | 0.7 | ~30 |
+| one-shot `GpuCsvTable` | 6.1 | 3.51 |
+| reused `GpuCsvScanner` | 2.3 | 9.48 |
 | — mm_csv, CPU, parse only | **2.2** | **9.42** |
 
-Two things to read off these.
+Three things to read off these.
 
-**The kernels are not the problem.** All five together are 3.5 ms on the 253 MB
-document — analyse and emit each read the whole document at about 200 GiB/s,
-and the two scans are almost free. That is roughly seven times the CPU
-library's parse rate on the same shape of document.
+**The device work is small and scales well.** On the 253 MB document analyse
+and emit each read the whole thing at about 285 GiB/s and the two scans cost
+1 ms between them: 2.6 ms of kernels, against 25 ms for the CPU library to
+parse the same shape. Add the upload and the index download and the device
+side is 4.4 ms.
 
-**The allocation is.** Of the 60.6 ms total, about 42 is neither file I/O nor
-compute: a fresh 253 MB pinned host buffer costs 4.5 ms to allocate and 22.5 ms
-to fault in on first touch, and the index buffers cost their own. A caller that
-scans one document and exits pays all of it. A caller that scans many should
-not, and the type as written gives it no way to avoid it — see
+**Allocation was three quarters of the one-shot cost**, and reusing a scanner
+removes it: 58.8 ms to 18.6. That is the single largest thing in this
+repository's history and it is not an optimisation of the algorithm at all.
+
+**What is left is the file read.** 13.3 ms of the 18.6. Two ways of making it
+faster have been measured and neither works — see
 [`docs/improvements.md`](docs/improvements.md).
 
 ## Development

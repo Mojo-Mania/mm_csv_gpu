@@ -3,9 +3,11 @@
 Run `bash data/setup.sh` first; it builds three files and prints their shape.
 None of them is committed.
 
-Two things are measured. **Total** is what a caller pays: opening the file,
-reading it into pinned memory, uploading it, five kernels, and copying the
-index back. **Phases** is the same work with a synchronisation between each
+Two things are measured. **One-shot** is what `GpuCsvTable` costs: allocate
+everything, read the file, upload, five kernels, copy the index back.
+**Reused** is the same work through a `GpuCsvScanner` that already owns its
+buffers, which is the number that matters for anything scanning more than one
+document. **Phases** is the same work with a synchronisation between each
 step, launched by hand from the library's own kernels, so the parts add up to
 something close to the total but not exactly -- the synchronisations are not
 free and the real path does not have them.
@@ -16,7 +18,7 @@ than a reimplementation here.
 """
 
 from max.gpu.host import DeviceContext
-from mm_csv_gpu import GpuCsvTable
+from mm_csv_gpu import GpuCsvScanner, GpuCsvTable
 from mm_csv_gpu.kernels import (
     CHUNK,
     COMMA,
@@ -109,7 +111,23 @@ def bench_file(ctx: DeviceContext, name: String) raises:
             raise Error("field count moved between runs")
         if elapsed < best:
             best = elapsed
-    report("total, file to index", best, bytes, fields)
+    report("one-shot GpuCsvTable", best, bytes, fields)
+
+    # The same work through a scanner sized up front, which is what the type
+    # is for: the allocation and the first-touch faults happen once, here,
+    # outside the measurement.
+    var scanner = GpuCsvScanner(ctx, capacity=bytes)
+    scanner.scan(ctx, path)
+    var best_warm = Float64(1e30)
+    for _ in range(REPEATS):
+        var start = perf_counter_ns()
+        scanner.scan(ctx, path)
+        var elapsed = Float64(perf_counter_ns() - start)
+        if len(scanner) != fields:
+            raise Error("field count moved between runs")
+        if elapsed < best_warm:
+            best_warm = elapsed
+    report("reused GpuCsvScanner", best_warm, bytes, fields)
 
     # The phases, with a synchronisation between each.
     var length = bytes
