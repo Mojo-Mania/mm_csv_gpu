@@ -1,0 +1,36 @@
+[workspace]
+preview = ["pixi-build"]
+authors = ["Maxim Zaks <maxim.zaks@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "mm_csv_gpu"
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+version = "0.1.0"
+
+[tasks]
+test = "mojo -I . test/test_csv_gpu.mojo"
+main = "mojo -I . examples/main.mojo"
+bench = "mojo -D ASSERT=none -I . benchmarks/bench_csv_gpu.mojo"
+format = "mojo format ./"
+docs = "mojo doc --diagnose-missing-doc-strings -o /dev/null mm_csv_gpu/"
+
+[dependencies]
+mojo = ">=1.1.0.dev2026091105,<2"
+max = "*"
+
+[package]
+name = "mm_csv_gpu"
+version = "0.1.0"
+
+[package.build]
+backend = { name = "pixi-build-mojo", version = ">=0.2.7", channels = [
+  "https://prefix.dev/pixi-build-backends",
+  "conda-forge",
+] }
+
+[package.host-dependencies]
+mojo = ">=1.1.0.dev2026091105,<2"
+max = "*"
+
+[package.run-dependencies]
+mojo = ">=1.1.0.dev2026091105,<2"
+max = "*"

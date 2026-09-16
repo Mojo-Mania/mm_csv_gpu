@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The tests need a GPU, which hosted runners do not have. What CI can prove
+  # is that everything compiles for the host and that the kernels compile for
+  # the device, which is where this library has actually broken: `pack_bits`
+  # took Metal's shader compiler down with no diagnostic.
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          cache: true
+
+      - name: Build the tests
+        run: pixi run mojo build -I . test/test_csv_gpu.mojo -o /tmp/test_csv_gpu
+
+      - name: Build the example
+        run: pixi run mojo build -I . examples/main.mojo -o /tmp/main_csv_gpu
+
+      - name: Build the benchmark
+        run: pixi run mojo build -D ASSERT=none -I . benchmarks/bench_csv_gpu.mojo -o /tmp/bench_csv_gpu
+
+  lint:
+    name: format and docstrings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          cache: true
+
+      - name: Check formatting
+        run: |
+          pixi run format
+          git diff --exit-code
+
+      - name: Check docstrings
+        run: pixi run docs
