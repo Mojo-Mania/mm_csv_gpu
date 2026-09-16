@@ -33,9 +33,9 @@ was an LF preceded by a CR.
 **Reuse the scanner, or most of the win goes to the allocator.** A fresh
 pinned host buffer the size of the document costs 4.5 ms to allocate and
 22.5 ms to fault in on first touch -- against 2.6 ms for all five kernels. So
-`GpuCsvTable`, which allocates per document, runs a 253 MB file in 58.8 ms,
-and a `GpuCsvScanner` that already owns its buffers runs the same file in
-**18.6 ms**. Use the scanner for anything but a one-off.
+`GpuCsvTable`, which allocates per document, runs a 253 MB file in 40 ms, and
+a `GpuCsvScanner` that already owns its buffers runs the same file in
+**18.5 ms**. Use the scanner for anything but a one-off.
 
 **Size matters more than usual.** At 23 MB a warm scan is 2.3 ms against the
 CPU library's 2.2 -- a wash. At 253 MB it is 18.6 ms against about 25 plus the
@@ -118,21 +118,21 @@ reimplementation here.
 
 | | ms | GiB/s | ns/field |
 | --- | ---: | ---: | ---: |
-| one-shot `GpuCsvTable` | 58.8 | 4.01 | 2.62 |
-| **reused `GpuCsvScanner`** | **18.6** | **12.64** | **0.83** |
-| read into pinned memory | 13.3 | 17.7 | 0.59 |
-| upload | 1.3 | **184.8** | 0.06 |
-| analyse | 0.8 | **281.1** | 0.04 |
-| one prefix scan (of two) | 0.5 | **462.9** | 0.02 |
-| emit | 0.8 | **285.9** | 0.04 |
-| index back | 0.5 | **502.3** | 0.02 |
+| one-shot `GpuCsvTable` | 40.2 | 5.86 | 1.80 |
+| **reused `GpuCsvScanner`** | **18.5** | **12.76** | **0.82** |
+| read into pinned memory | 13.4 | 17.6 | 0.60 |
+| upload | 1.3 | **187.7** | 0.06 |
+| analyse | 1.2 | **202.2** | 0.05 |
+| one prefix scan (of two) | 0.6 | **375.2** | 0.03 |
+| emit | 1.1 | **219.6** | 0.05 |
+| index back | 0.5 | **512.2** | 0.02 |
 
 **`small.csv`** — 23 MB, 255 361 rows, 8 columns, 2 042 888 fields:
 
 | | ms | GiB/s |
 | --- | ---: | ---: |
-| one-shot `GpuCsvTable` | 6.1 | 3.51 |
-| reused `GpuCsvScanner` | 2.3 | 9.48 |
+| one-shot `GpuCsvTable` | 5.8 | 3.73 |
+| reused `GpuCsvScanner` | 2.3 | 9.49 |
 | — mm_csv, CPU, parse only | **2.2** | **9.42** |
 
 Three things to read off these.
@@ -144,8 +144,12 @@ parse the same shape. Add the upload and the index download and the device
 side is 4.4 ms.
 
 **Allocation was three quarters of the one-shot cost**, and reusing a scanner
-removes it: 58.8 ms to 18.6. That is the single largest thing in this
+removes it: 58.8 ms to 18.5. That is the single largest thing in this
 repository's history and it is not an optimisation of the algorithm at all.
+Overlapping the read with the upload took the one-shot path from 58.8 to 40 by
+hiding the same page faults a different way — see
+[`docs/improvements.md`](docs/improvements.md), where it is also the one
+measurement that helped a path it was not aimed at.
 
 **What is left is the file read.** 13.3 ms of the 18.6. Two ways of making it
 faster have been measured and neither works — see

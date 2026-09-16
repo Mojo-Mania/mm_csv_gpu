@@ -37,6 +37,15 @@ from .kernels import (
 )
 from .scan import scan_apply_kernel, scan_block_kernel, scan_totals_kernel
 
+comptime UPLOAD_SLICE = 16 * 1024 * 1024
+"""Bytes read before the upload of what was read is enqueued.
+
+Reading the file runs at about 17.7 GiB/s and the upload at 185, so the
+upload is the smaller of the two and can hide behind the next read. Enqueued
+work does not block, so slicing the loop is the whole trick. Measured on a
+253 MB document: 15.8 ms in one slice, 14.9 at sixteen or more, and flat
+after that. A document under this size is one slice and unchanged."""
+
 comptime MAX_LENGTH = (1 << 31) - 1
 """Field positions are 31 bits and a flag. Written out rather than as
 `Int(UInt32.MAX >> 1)`; see mm_csv for what `Int(UInt32.MAX)` does."""
@@ -180,27 +189,47 @@ struct GpuCsvScanner[separator: UInt8 = COMMA](Movable, Sized):
 
         self._reserve(ctx, length)
 
-        with open(path, "r") as f:
-            var got = f.read(
-                Span[UInt8, MutUntrackedOrigin](
-                    unsafe_ptr=self._text.unsafe_ptr(), length=length
-                )
-            )
-            if got != length:
-                raise Error("short read: got ", got, " of ", length, " bytes")
         # The four loads in `chunk_masks` always read a whole chunk, so the
         # bytes past the document have to be there and have to be harmless.
+        # Zeroed first, because the last slice carries them up with it.
         for i in range(length, length + CHUNK):
             self._text[i] = UInt8(0)
 
+        # Read a slice, enqueue its upload, read the next. The upload does not
+        # block, so it flies while the next slice is being read.
+        with open(path, "r") as f:
+            var offset = 0
+            while offset < length:
+                var take = UPLOAD_SLICE
+                if offset + take > length:
+                    take = length - offset
+                var got = f.read(
+                    Span[UInt8, MutUntrackedOrigin](
+                        unsafe_ptr=self._text.unsafe_ptr().unsafe_offset(
+                            offset
+                        ),
+                        length=take,
+                    )
+                )
+                if got != take:
+                    raise Error("short read: got ", got, " of ", take, " bytes")
+                # The last slice carries the padding, which is already zeroed.
+                var span = take + CHUNK if offset + take == length else take
+                var view = self._document.create_sub_buffer[DType.uint8](
+                    offset, span
+                )
+                view.enqueue_copy_from(
+                    Span[UInt8, MutUntrackedOrigin](
+                        unsafe_ptr=self._text.unsafe_ptr().unsafe_offset(
+                            offset
+                        ),
+                        length=span,
+                    )
+                )
+                offset += take
+
         var chunks = (length + CHUNK - 1) // CHUNK
         var blocks = (chunks + THREADS - 1) // THREADS
-
-        self._document.enqueue_copy_from(
-            Span[UInt8, MutUntrackedOrigin](
-                unsafe_ptr=self._text.unsafe_ptr(), length=length + CHUNK
-            )
-        )
 
         ctx.enqueue_function[analyse_kernel[Self.separator]](
             self._document.unsafe_ptr(),

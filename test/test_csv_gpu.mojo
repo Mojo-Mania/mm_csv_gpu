@@ -14,6 +14,7 @@ blocks, and across tiles of blocks.
 from max.gpu.host import DeviceContext
 from mm_csv_gpu import GpuCsvScanner, GpuCsvTable
 from mm_csv_gpu.kernels import CR, CRLF_BIT, LF, OFFSET_MASK, QUOTE
+from mm_csv_gpu.scanner import UPLOAD_SLICE
 from std.pathlib import Path
 from std.testing import TestSuite, assert_equal, assert_true
 
@@ -180,6 +181,50 @@ def test_across_scan_tiles() raises:
     )
     var scanner = GpuCsvScanner(ctx)
     _assert_matches(ctx, scanner, text, "5 MB, many tiles of blocks")
+
+
+def test_across_upload_slices() raises:
+    """More than one upload slice, so the read-and-upload loop is exercised.
+
+    The read is sliced and each slice's upload is enqueued before the next
+    slice is read, which means the slice arithmetic decides whether the
+    document arrives intact. Nothing below 16 MiB goes round that loop twice,
+    and every other test here is smaller than that.
+
+    The document is written a block at a time rather than built as one String,
+    and checked arithmetically rather than against `_reference`, because at
+    this size both of those matter.
+    """
+    var rows_per_block = 80_000
+    var block = String()
+    for _ in range(rows_per_block):
+        block += "aaa,bbb,ccc\r\n"
+    var blocks = 3 * UPLOAD_SLICE // block.byte_length() + 1
+    with open(SCRATCH, "w") as f:
+        for _ in range(blocks):
+            f.write(block)
+
+    var rows = rows_per_block * blocks
+    var ctx = DeviceContext()
+    var scanner = GpuCsvScanner(ctx)
+    scanner.scan(ctx, Path(SCRATCH))
+    assert_true(
+        rows * 13 > 2 * UPLOAD_SLICE,
+        "the document has to cross an upload slice boundary",
+    )
+    assert_equal(len(scanner), rows * 3, "field count")
+    assert_equal(scanner.column_count, 3, "columns")
+
+    # Row r starts at 13r: commas at +3 and +7, the CRLF row end at +12.
+    for r in range(rows):
+        var base = 13 * r
+        assert_equal(Int(scanner._index[3 * r]), base + 3, "first comma")
+        assert_equal(Int(scanner._index[3 * r + 1]), base + 7, "second comma")
+        assert_equal(
+            Int(scanner._index[3 * r + 2]),
+            (base + 12) | Int(CRLF_BIT),
+            "row end",
+        )
 
 
 def test_unterminated_quote() raises:
