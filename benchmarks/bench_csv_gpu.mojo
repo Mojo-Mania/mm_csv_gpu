@@ -27,11 +27,7 @@ from mm_csv_gpu.kernels import (
     emit_kernel,
     select_counts_kernel,
 )
-from mm_csv_gpu.scan import (
-    scan_apply_kernel,
-    scan_block_kernel,
-    scan_totals_kernel,
-)
+
 from std.pathlib import Path, cwd
 from std.time import perf_counter_ns
 
@@ -140,11 +136,7 @@ def bench_file(ctx: DeviceContext, name: String) raises:
     var outside = ctx.enqueue_create_buffer[DType.uint32](chunks)
     var inside = ctx.enqueue_create_buffer[DType.uint32](chunks)
     var counts = ctx.enqueue_create_buffer[DType.uint32](chunks)
-    # Distinct from `carry` only because passing one buffer as two arguments
-    # of a launch is rejected as aliasing; the library scans in place.
-    var scanned = ctx.enqueue_create_buffer[DType.uint32](chunks)
     var totals = ctx.enqueue_create_buffer[DType.uint32](blocks)
-    var offs = ctx.enqueue_create_buffer[DType.uint32](blocks)
     var grand = ctx.enqueue_create_buffer[DType.uint32](1)
     var index = ctx.enqueue_create_buffer[DType.uint32](fields + 1)
     var index_host = ctx.enqueue_create_host_buffer[DType.uint32](fields + 1)
@@ -197,32 +189,16 @@ def bench_file(ctx: DeviceContext, name: String) raises:
             best_analyse = elapsed
     report("  analyse", best_analyse, bytes, fields)
 
+    # The library's own scan, not a hand-rolled one: it is two levels deep on
+    # a document this size and a re-implementation here would drift.
+    var totals2 = ctx.enqueue_create_buffer[DType.uint32](
+        (blocks + THREADS - 1) // THREADS
+    )
+    ctx.synchronize()
     var best_scan = Float64(1e30)
     for _ in range(REPEATS):
         var start = perf_counter_ns()
-        ctx.enqueue_function[scan_block_kernel](
-            carry.unsafe_ptr(),
-            scanned.unsafe_ptr(),
-            totals.unsafe_ptr(),
-            Int32(chunks),
-            grid_dim=blocks,
-            block_dim=THREADS,
-        )
-        ctx.enqueue_function[scan_totals_kernel](
-            totals.unsafe_ptr(),
-            offs.unsafe_ptr(),
-            grand.unsafe_ptr(),
-            Int32(blocks),
-            grid_dim=1,
-            block_dim=THREADS,
-        )
-        ctx.enqueue_function[scan_apply_kernel](
-            scanned.unsafe_ptr(),
-            offs.unsafe_ptr(),
-            Int32(chunks),
-            grid_dim=blocks,
-            block_dim=THREADS,
-        )
+        GpuCsvScanner[COMMA]._scan(ctx, carry, totals, totals2, grand, chunks)
         ctx.synchronize()
         var elapsed = Float64(perf_counter_ns() - start)
         if elapsed < best_scan:

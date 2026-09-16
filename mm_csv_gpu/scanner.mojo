@@ -65,8 +65,8 @@ struct GpuCsvScanner[separator: UInt8 = COMMA](Movable, Sized):
     var _outside: DeviceBuffer[DType.uint32]
     var _inside: DeviceBuffer[DType.uint32]
     var _counts: DeviceBuffer[DType.uint32]
-    var _block_totals: DeviceBuffer[DType.uint32]
-    var _block_offsets: DeviceBuffer[DType.uint32]
+    var _totals: DeviceBuffer[DType.uint32]
+    var _totals2: DeviceBuffer[DType.uint32]
     var _grand: DeviceBuffer[DType.uint32]
     var _index_device: DeviceBuffer[DType.uint32]
     var _index: HostBuffer[DType.uint32]
@@ -116,8 +116,8 @@ struct GpuCsvScanner[separator: UInt8 = COMMA](Movable, Sized):
         self._outside = ctx.enqueue_create_buffer[DType.uint32](1)
         self._inside = ctx.enqueue_create_buffer[DType.uint32](1)
         self._counts = ctx.enqueue_create_buffer[DType.uint32](1)
-        self._block_totals = ctx.enqueue_create_buffer[DType.uint32](1)
-        self._block_offsets = ctx.enqueue_create_buffer[DType.uint32](1)
+        self._totals = ctx.enqueue_create_buffer[DType.uint32](1)
+        self._totals2 = ctx.enqueue_create_buffer[DType.uint32](1)
         self._grand = ctx.enqueue_create_buffer[DType.uint32](1)
         self._index_device = ctx.enqueue_create_buffer[DType.uint32](1)
         self._index = ctx.enqueue_create_host_buffer[DType.uint32](1)
@@ -137,6 +137,7 @@ struct GpuCsvScanner[separator: UInt8 = COMMA](Movable, Sized):
             return
         var chunks = (length + CHUNK - 1) // CHUNK
         var blocks = (chunks + THREADS - 1) // THREADS
+        var blocks2 = (blocks + THREADS - 1) // THREADS
 
         self._text = ctx.enqueue_create_host_buffer[DType.uint8](needed)
         self._document = ctx.enqueue_create_buffer[DType.uint8](needed)
@@ -144,8 +145,8 @@ struct GpuCsvScanner[separator: UInt8 = COMMA](Movable, Sized):
         self._outside = ctx.enqueue_create_buffer[DType.uint32](chunks)
         self._inside = ctx.enqueue_create_buffer[DType.uint32](chunks)
         self._counts = ctx.enqueue_create_buffer[DType.uint32](chunks)
-        self._block_totals = ctx.enqueue_create_buffer[DType.uint32](blocks)
-        self._block_offsets = ctx.enqueue_create_buffer[DType.uint32](blocks)
+        self._totals = ctx.enqueue_create_buffer[DType.uint32](blocks)
+        self._totals2 = ctx.enqueue_create_buffer[DType.uint32](blocks2)
         ctx.synchronize()
 
         self._bytes_capacity = needed
@@ -245,11 +246,10 @@ struct GpuCsvScanner[separator: UInt8 = COMMA](Movable, Sized):
         Self._scan(
             ctx,
             self._carry,
-            self._block_totals,
-            self._block_offsets,
+            self._totals,
+            self._totals2,
             self._grand,
             chunks,
-            blocks,
         )
 
         ctx.enqueue_function[select_counts_kernel](
@@ -265,11 +265,10 @@ struct GpuCsvScanner[separator: UInt8 = COMMA](Movable, Sized):
         Self._scan(
             ctx,
             self._counts,
-            self._block_totals,
-            self._block_offsets,
+            self._totals,
+            self._totals2,
             self._grand,
             chunks,
-            blocks,
         )
 
         # `map_to_host` does not wait for enqueued work by itself, and without
@@ -319,36 +318,87 @@ struct GpuCsvScanner[separator: UInt8 = COMMA](Movable, Sized):
     def _scan(
         ctx: DeviceContext,
         values: DeviceBuffer[DType.uint32],
-        block_totals: DeviceBuffer[DType.uint32],
-        block_offsets: DeviceBuffer[DType.uint32],
+        totals: DeviceBuffer[DType.uint32],
+        totals2: DeviceBuffer[DType.uint32],
         grand: DeviceBuffer[DType.uint32],
         n: Int,
-        blocks: Int,
     ) raises:
         """Turns `values` into its own exclusive prefix sum, in place.
 
-        In place is safe because `scan_block_kernel` reads its element into a
-        register before writing one.
+        In place is safe because `scan_block_kernel` and `scan_totals_kernel`
+        both read an element into a register before writing one.
+
+        The recursion is written out rather than looped, because it is never
+        more than three levels deep. A chunk is 64 bytes and a block scans 256
+        of them, so a 2 GiB document -- the largest this library takes -- has
+        33.5 M chunks, 131 072 block totals, and 512 totals of those. The
+        innermost level walks its input in tiles of `THREADS` with a running
+        carry, so at 2 GiB it walks two tiles, and at 253 MB it walks one.
+
+        That is the whole point of the second level. Without it the innermost
+        kernel is the only one there is, and it walks **every** block total:
+        61 serial tiles on a 253 MB document and 512 on a 2 GiB one, in a
+        single block, while the rest of the device idles.
         """
+        if n <= THREADS:
+            ctx.enqueue_function[scan_totals_kernel](
+                values.unsafe_ptr(),
+                values.unsafe_ptr(),
+                grand.unsafe_ptr(),
+                Int32(n),
+                grid_dim=1,
+                block_dim=THREADS,
+            )
+            return
+
+        var blocks = (n + THREADS - 1) // THREADS
         ctx.enqueue_function[scan_block_kernel](
             values.unsafe_ptr(),
             values.unsafe_ptr(),
-            block_totals.unsafe_ptr(),
+            totals.unsafe_ptr(),
             Int32(n),
             grid_dim=blocks,
             block_dim=THREADS,
         )
-        ctx.enqueue_function[scan_totals_kernel](
-            block_totals.unsafe_ptr(),
-            block_offsets.unsafe_ptr(),
-            grand.unsafe_ptr(),
-            Int32(blocks),
-            grid_dim=1,
-            block_dim=THREADS,
-        )
+
+        if blocks <= THREADS:
+            ctx.enqueue_function[scan_totals_kernel](
+                totals.unsafe_ptr(),
+                totals.unsafe_ptr(),
+                grand.unsafe_ptr(),
+                Int32(blocks),
+                grid_dim=1,
+                block_dim=THREADS,
+            )
+        else:
+            var blocks2 = (blocks + THREADS - 1) // THREADS
+            ctx.enqueue_function[scan_block_kernel](
+                totals.unsafe_ptr(),
+                totals.unsafe_ptr(),
+                totals2.unsafe_ptr(),
+                Int32(blocks),
+                grid_dim=blocks2,
+                block_dim=THREADS,
+            )
+            ctx.enqueue_function[scan_totals_kernel](
+                totals2.unsafe_ptr(),
+                totals2.unsafe_ptr(),
+                grand.unsafe_ptr(),
+                Int32(blocks2),
+                grid_dim=1,
+                block_dim=THREADS,
+            )
+            ctx.enqueue_function[scan_apply_kernel](
+                totals.unsafe_ptr(),
+                totals2.unsafe_ptr(),
+                Int32(blocks),
+                grid_dim=blocks2,
+                block_dim=THREADS,
+            )
+
         ctx.enqueue_function[scan_apply_kernel](
             values.unsafe_ptr(),
-            block_offsets.unsafe_ptr(),
+            totals.unsafe_ptr(),
             Int32(n),
             grid_dim=blocks,
             block_dim=THREADS,

@@ -136,12 +136,35 @@ have, and it measured *slower* than storing -- 1212 µs against 1159. mm_csv's
 re-profile records the same trap in the same words. Knowing about a trap and
 walking into it are different skills.
 
+## Done: the prefix scan goes two levels deep
+
+`_scan` used to be one level: scan each block's slice, then hand *every* block
+total to a single block that walked them in tiles with a running carry. A
+chunk is 64 bytes and a block scans 256 of them, so that inner walk was 61
+serial tiles on a 253 MB document and 512 on a 2 GiB one, on one block, while
+the rest of the device idled.
+
+It now scans the totals the same way it scans the values, and only the totals
+*of those* go to the single-block kernel. Two levels covers everything under
+the 2 GiB ceiling: 33.5 M chunks, 131 072 totals, 512 totals of those, and the
+innermost kernel walks two tiles.
+
+Measured on the scan alone, same data, same process:
+
+| document | block totals | one level | two levels |
+| --- | ---: | ---: | ---: |
+| 64 MiB | 4 096 | 519 µs | **220 µs** |
+| 253 MiB | 16 192 | 644 µs | **519 µs** |
+| 1 GiB | 65 536 | 2 103 µs | **1 670 µs** |
+
+**End to end this is worth about 1.4%** -- two scans at 0.52 ms against two at
+0.64 -- which is under the noise floor of the benchmark, and the warm total
+did not visibly move. It is a scaling fix rather than a speed fix, and the
+honest reason to have it is the 2 GiB column rather than the 253 MB one.
+
 ## Smaller things
 
-- **`scan_totals_kernel` is one block.** It walks the block totals in tiles of
-  256 with a running carry, so a 512 MB document puts 32 768 totals through one
-  block. It measures at 0.6 ms for both scans together, so this has not been
-  worth fixing, but it is the one part of the pipeline that does not scale.
+- **`scan_totals_kernel` being one block: fixed.** See below.
 - **Narrowing the index: measured, and it loses.** See below.
 - **`is_quoted` and `get` are not here.** Undoing RFC 4180 escaping is
   per-field work on the host; mm_csv does it. A GPU version would have to

@@ -68,7 +68,9 @@ the state is computed instead of carried:
    extra `popcount`.
 2. **scan** — an exclusive prefix sum over the parities. Its low bit is each
    chunk's incoming quote state, because an exclusive prefix *XOR* over one-bit
-   values is the low bit of an exclusive prefix *sum* over them.
+   values is the low bit of an exclusive prefix *sum* over them. It is two
+   levels deep: the block totals are scanned the same way the values are, and
+   only the totals of *those* go to a single block.
 3. **select** — each chunk picks the count that its now-known carry makes true.
 4. **scan** — again, over those counts, giving each chunk where to write.
 5. **emit** — recompute the masks, apply the carry, write one entry per field.

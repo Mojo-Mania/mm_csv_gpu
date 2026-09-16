@@ -166,10 +166,16 @@ def test_across_blocks() raises:
 
 
 def test_across_scan_tiles() raises:
-    """More than `THREADS` blocks, so `scan_totals_kernel` has to loop.
+    """More than `THREADS` blocks, so the prefix scan goes two levels deep.
 
-    A block covers 16 KiB, so the totals scan only tiles past 4 MiB. Below
-    that this whole level of the scan is a single pass and never tested.
+    A block covers 16 KiB of document, so past 4 MiB there are more block
+    totals than one block can scan in a single tile and `_scan` adds a level.
+    Below that the second level is never built and never tested.
+
+    The innermost kernel still walks its input in tiles with a running carry,
+    but with two levels above it that input is tiny -- two entries at 2 GiB.
+    Making *it* loop would need a document past a gigabyte, which is more than
+    a test should write.
     """
     var ctx = DeviceContext()
     var text = String()
