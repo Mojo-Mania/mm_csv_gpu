@@ -102,16 +102,47 @@ bytes is 0.375x the document in extra memory to save one re-read at 200 GiB/s.
 On a device where allocation is already the bottleneck, spending memory to save
 bandwidth is the wrong direction.
 
+## Narrowing the index: tried, and it loses here too
+
+The CPU library found 3-byte slots slower because the store *count* is what
+costs there, not the bytes. On a GPU the index is 85 MiB and has to be
+downloaded, so the trade looked like it might go the other way. It does not.
+
+Same walk, same number of stores, same alignment, half the bytes:
+
+| | µs |
+| --- | ---: |
+| emit, 4-byte entries | 1158 |
+| emit, **2-byte** entries | **1479** |
+| download 4-byte, 85 MiB | 489 |
+| download 2-byte, 43 MiB | 269 |
+
+Halving the entry makes the emit **28% slower** and the download 220 µs
+faster: **net 101 µs worse**. A sixteen-bit store per lane does not serve the
+memory system as well as a thirty-two-bit one, and that costs more than the
+bytes saved are worth.
+
+That is before the ceiling, which settles it anyway. The offset needs the
+whole entry bar the CRLF flag, so two bytes caps a document at 32 KiB and
+three bytes at 8 MiB. This library exists for documents in the hundreds of
+megabytes. Narrowing trades away three orders of magnitude of document size
+for a change that is negative.
+
+**The first attempt at measuring this was invalid**, in exactly the way this
+repository's sibling already had written down. The plan was to time the emit
+with the store removed, to price the writes; the variant accumulated into a
+register instead, which creates a serial dependency the real loop does not
+have, and it measured *slower* than storing -- 1212 µs against 1159. mm_csv's
+re-profile records the same trap in the same words. Knowing about a trap and
+walking into it are different skills.
+
 ## Smaller things
 
 - **`scan_totals_kernel` is one block.** It walks the block totals in tiles of
   256 with a running carry, so a 512 MB document puts 32 768 totals through one
   block. It measures at 0.6 ms for both scans together, so this has not been
   worth fixing, but it is the one part of the pipeline that does not scale.
-- **The index could be narrower.** The CPU library measured 3-byte slots as
-  *slower* because the store count is what costs, not the bytes. On a GPU the
-  download is 90 MB and bandwidth-bound, so the trade may go the other way.
-  Unmeasured.
+- **Narrowing the index: measured, and it loses.** See below.
 - **`is_quoted` and `get` are not here.** Undoing RFC 4180 escaping is
   per-field work on the host; mm_csv does it. A GPU version would have to
   decide where the unescaped bytes live.
