@@ -179,6 +179,7 @@ def bench_file(ctx: DeviceContext, name: String) raises:
             outside.unsafe_ptr(),
             inside.unsafe_ptr(),
             Int32(length),
+            Int32(0),
             Int32(chunks),
             grid_dim=blocks,
             block_dim=THREADS,
@@ -214,7 +215,9 @@ def bench_file(ctx: DeviceContext, name: String) raises:
             counts.unsafe_ptr(),
             index.unsafe_ptr(),
             Int32(length),
+            Int32(0),
             Int32(chunks),
+            Int32(0),
             grid_dim=blocks,
             block_dim=THREADS,
         )

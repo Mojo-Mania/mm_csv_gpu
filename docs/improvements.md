@@ -15,7 +15,12 @@ are invalid after the next `scan` -- that is the bargain, and `GpuCsvTable`
 still exists for callers who would rather not take it.
 
 What is left of the 18.6 ms is 13.3 of file read and 4.4 of device work. The
-next section was the reasoning; the one after it is where the time went next.
+next section was the reasoning, written before the scanner existed; the one
+after it is where the time went next.
+
+All of this is Apple M4 Max. On a laptop RTX 4050 one-shot and reused are
+within 2% of each other, so this fix is worth nothing there -- see the last
+section.
 
 ## The allocation was the whole cost, and this is why
 
@@ -70,7 +75,12 @@ back.
 ## Reading the file is the next largest piece
 
 13.4 ms of the 18.7 is `FileHandle.read` into the pinned buffer — 17.6 GiB/s,
-against the 185 GiB/s the upload manages. Both of these would be worth trying:
+against the 185 GiB/s the upload manages. Both of these have since been
+tried. Overlapping the read with the upload shipped, and took the one-shot
+path from 58.8 ms to 40 and the warm one by about 2%. `mmap` does not help:
+`enqueue_copy_from` over a mapping crashes the runtime, and filling the pinned
+buffer by memcpy from one is 38% slower than reading into it. The ideas as
+first written:
 
 - **Read and upload in overlapping slices.** Read a slice, start its upload,
   read the next while that one flies. The scan cannot start until the whole
@@ -164,8 +174,136 @@ honest reason to have it is the 2 GiB column rather than the 253 MB one.
 
 ## Smaller things
 
-- **`scan_totals_kernel` being one block: fixed.** See below.
-- **Narrowing the index: measured, and it loses.** See below.
+- **`scan_totals_kernel` being one block: fixed.** See above.
+- **Narrowing the index: measured, and it loses.** See above.
 - **`is_quoted` and `get` are not here.** Undoing RFC 4180 escaping is
   per-field work on the host; mm_csv does it. A GPU version would have to
   decide where the unescaped bytes live.
+
+## On a discrete card: SWAR for the kernels, and then the link
+
+First measured on a laptop RTX 4050 (PCIe 4.0 x8, CUDA 13.3, Linux) next to an
+AMD Ryzen AI 9 HX 370. All tests pass there.
+
+### Done: read the chunk as words, not vectors, off Apple
+
+The first run had analyse at 7.8 ms and emit at 9.0 on the 253 MB document --
+25-30 GiB/s, against 200-220 on the M4 Max -- while the prefix scan on the
+same card ran at over 1 000 GiB/s. So launching kernels was fine and the two
+passes that read the document were not.
+
+`dump_llvm` on the launch says why. NVIDIA's backend does not keep `SIMD`
+vectors as vectors. `unsafe_load[width=16]` becomes a sixteen-iteration loop
+of `insertelement`, four of them per chunk, and the compares and weighted
+reduces come out as scalars: about 950 lines of NVPTX assembly per chunk.
+
+On non-Apple devices `chunk_masks` now loads eight `UInt64` words and finds
+each byte class with the exact SWAR equality -- XOR, add `0x7F` to the low
+seven bits, keep the high bits that stayed clear -- and a multiply that
+gathers the eight flags into one byte. Selected with
+`comptime if is_apple_gpu()`, which is resolved for the device inside a
+kernel. Measured in isolation, same buffers, same process, outputs compared
+entry for entry:
+
+| `large.csv` | `SIMD` | SWAR |
+| --- | ---: | ---: |
+| analyse | 9 780 µs | **1 878 µs** |
+| emit | 8 959 µs | **2 038 µs** |
+
+End to end, 46.4 ms to **33.2** on `large.csv` and 5.4 to 4.1 on `small.csv`.
+Breaking the SWAR equality fails ten of the eleven tests, so they do run it.
+
+**Not measured on Metal.** Apple keeps the `SIMD` version because that is what
+its 200 GiB/s was measured with. The word version may well be as fast there
+or faster; that is one run on the M4 Max away.
+
+### Tried: letting kernels touch pinned host memory
+
+On Metal a kernel reads zeros from a pinned host buffer. On CUDA it reads the
+right values, so zero-copy was worth pricing on `large.csv`:
+
+| | ms |
+| --- | ---: |
+| analyse reading the pinned host document | 30.4 |
+| upload, then analyse on the device | 20.4 |
+| emit writing into a pinned host index | **1 016** |
+| emit on the device, then download | 8.9 |
+
+A kernel reading host memory pays the bus on every access instead of once in
+bulk, and writing the index that way is a hundred times worse. Not worth
+trying again. `is_host_unified()` is false on this card, as expected.
+
+### Done: download the index while the document is still going up
+
+Timed at the scanner's synchronisation points, the 33 ms whole-document scan
+was 21.9 of read and upload overlapping, 2.3 of analyse and both scans, and
+8.9 of emit and download. The download sat idle until the whole document was
+up, and PCIe is full duplex.
+
+**First, whether the card can do it.** Raw CUDA, two streams, pinned memory,
+a 253 MB upload and an 85 MB download: 26.5 ms one after the other, 19.9 at
+once. So the hardware has a copy engine each way.
+
+**Then, why MAX could not.** The same two copies issued through MAX on two
+streams took 26.5 ms either way -- until the download's buffers were created
+*on the second stream*. Then 19.9, the same as raw CUDA, whichever copy call
+was used. A copy through a buffer waits for the stream that created it.
+Kernels take raw pointers and do not, so the emit on the first stream writes
+into the second stream's index freely.
+
+**The scan, sliced.** Everything a chunk needs from the chunks before it is
+the quote state and its first index entry. So on a discrete device the
+document goes a slice at a time: read, upload, analyse, both scans and select
+on the first stream, with the quote state carried to the next slice in a
+one-element device buffer that `select` folds in and `fold_parity_kernel`
+advances -- no host involvement. The slice's field count is copied back on
+the second stream. One slice later the host has that count, which says where
+the slice's entries go, and enqueues its emit on the first stream and its
+download on the second, behind an `enqueue_wait_for`. The index grows between
+slices when it has to, after both streams drain; a scanner that has seen a
+document that size never does.
+
+With unified memory none of this helps -- the index comes back at 500 GiB/s --
+so that path is unchanged and still scans the document whole.
+
+Slice size, reused scanner, best of five:
+
+| slice | `small.csv` | `large.csv` |
+| --- | ---: | ---: |
+| 1 MiB | 2.9 ms | 30.0 ms |
+| 2 MiB | 2.8 | 27.8 |
+| **4 MiB** | **2.8** | **27.2** |
+| 8 MiB | 3.3 | 27.4 |
+| 16 MiB | 4.2 | 28.0 |
+| 32 MiB | 4.6 | 29.4 |
+| 64 MiB | 4.6 | 32.3 |
+
+Small slices pay a host synchronisation each; large ones leave the last
+slice's download with no upload to hide behind, which is why `small.csv`, two
+slices at 16 MiB, gained nothing until they shrank. The same scanner forced
+down the whole path on the same machine measures 33.3 ms and 4.1, so the
+gain is 18% and 30%.
+
+**Tests.** `test_quotes_across_stream_slices` puts quoted regions and CRLFs
+across 4 MiB boundaries and checks one document streamed, whole, and streamed
+again against the scalar reference. Not folding the parity fails it and only
+it. Ignoring `start` in the emit fails it and the two other multi-slice
+tests. Dropping the download's wait for the emit crashes the suite: the
+column count reads the document at whatever garbage offsets came back.
+
+### What is left is the upload
+
+The upload runs at 12.5 GiB/s, which is PCIe 4.0 x8 full, so more streams or a
+faster read cannot help it; 18.8 ms of the 27 is that. What could still move:
+
+- **Download less.** Keeping the index on the device for further GPU work, or
+  returning only what a caller asks for, removes the rest of the download and
+  changes the API.
+- **The Radeon 890M on the same laptop shares RAM with the CPU**, like Apple
+  silicon. MAX does not see it here -- `gpu-query` lists only the RTX 4050 and
+  ROCm is not installed -- so whether it would behave like the M4 Max is
+  untested.
+
+Even at zero cost for every kernel, the upload alone here is 18.8 ms against
+the CPU's 14.1 ms parse. On this card the GPU is not a win for this problem
+unless the index stays on the device for further GPU work.

@@ -10,7 +10,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Hosted runners have no GPU, so the ten tests cannot run here -- they need a
+# Hosted runners have no GPU, so the twelve tests cannot run here -- they need a
 # real device and are run before every push (`pixi run test`, about a second).
 #
 # What CI *can* do is compile the kernels, which is where this library has

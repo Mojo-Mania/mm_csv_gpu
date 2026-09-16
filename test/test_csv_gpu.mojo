@@ -14,7 +14,7 @@ blocks, and across tiles of blocks.
 from max.gpu.host import DeviceContext
 from mm_csv_gpu import GpuCsvScanner, GpuCsvTable
 from mm_csv_gpu.kernels import CR, CRLF_BIT, LF, OFFSET_MASK, QUOTE
-from mm_csv_gpu.scanner import UPLOAD_SLICE
+from mm_csv_gpu.scanner import STREAM_SLICE, UPLOAD_SLICE
 from std.pathlib import Path
 from std.testing import TestSuite, assert_equal, assert_true
 
@@ -231,6 +231,54 @@ def test_across_upload_slices() raises:
             (base + 12) | Int(CRLF_BIT),
             "row end",
         )
+
+
+def test_quotes_across_stream_slices() raises:
+    """Quoted regions and CRLFs cut by slice boundaries, down both paths.
+
+    On a discrete device `scan` counts each slice on its own and carries the
+    quote state between slices on the device, then emits and downloads a
+    slice at a time into an index that grows as it goes. Every one of those
+    is a way to get an entry wrong that a single-slice document cannot reach,
+    and `test_across_upload_slices` has no quotes in it at all.
+
+    So: rows whose quoted field holds commas and line breaks, a few megabytes
+    of them, and at each slice boundary either a quote opened just before it
+    and closed just after, or a CRLF split across it. Checked against the scalar
+    reference, once streamed and once whole, through one scanner -- the second
+    scan also exercises an index that no longer needs to grow.
+    """
+    var text = String()
+    for b in range(4):
+        var target = (b + 1) * STREAM_SLICE
+        var i = 0
+        while text.byte_length() < target - 64:
+            if i % 7 == 0:
+                text += 'x,"a,\r\nb",y\r\n'
+            else:
+                text += "abc,de,f\r\n"
+            i += 1
+        if b % 2 == 0:
+            # A quote opened two bytes before the boundary, closed after it.
+            while text.byte_length() < target - 3:
+                text += "z"
+            text += ',"q'
+            text += ',r\r\n",s\r\n'
+        else:
+            # A CRLF whose CR is the last byte of the slice.
+            while text.byte_length() < target - 1:
+                text += "w"
+            text += "\r\nnext,row\r\n"
+    text += "tail,without,newline"
+
+    var ctx = DeviceContext()
+    var scanner = GpuCsvScanner(ctx)
+    scanner._streamed = True
+    _assert_matches(ctx, scanner, text, "streamed")
+    scanner._streamed = False
+    _assert_matches(ctx, scanner, text, "whole")
+    scanner._streamed = True
+    _assert_matches(ctx, scanner, text, "streamed again")
 
 
 def test_unterminated_quote() raises:
