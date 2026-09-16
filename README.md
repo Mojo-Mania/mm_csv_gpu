@@ -32,7 +32,7 @@ was an LF preceded by a CR.
 
 **Which GPU matters more than anything else here.** On an Apple M4 Max a
 reused scanner finds the fields of a 253 MB document in 18.5 ms, against
-about 25 for the CPU library to parse the same shape. On a laptop RTX 4050
+24.4 for the CPU library to parse the same bytes. On a laptop RTX 4050
 the same scan takes 27.4 ms, and the CPU next to it parses the same bytes in
 14.1. Measure on the machine you will ship to.
 
@@ -159,6 +159,22 @@ it overlaps the read with the upload in 16 MiB slices.
 | one prefix scan (of two) | 0.6 | **375.2** | 0.03 |
 | emit | 1.1 | **219.6** | 0.05 |
 | index back | 0.5 | **512.2** | 0.02 |
+| — mm_csv, CPU, parse only | 24.4 | 9.66 | 1.09 |
+
+**`quoted.csv`** — 272 MB, 2 200 001 rows, 10 columns, 22 000 010 fields,
+one quoted field containing a comma in every row:
+
+| | ms | GiB/s | ns/field |
+| --- | ---: | ---: | ---: |
+| one-shot `GpuCsvTable` | 38.8 | 6.53 | 1.76 |
+| **reused `GpuCsvScanner`** | **18.1** | **14.04** | **0.82** |
+| read into pinned memory | 13.4 | 18.9 | 0.61 |
+| upload | 1.3 | **191.3** | 0.06 |
+| analyse | 0.9 | **279.5** | 0.04 |
+| one prefix scan (of two) | 0.4 | **567.1** | 0.02 |
+| emit | 0.9 | **288.4** | 0.04 |
+| index back | 0.5 | **562.1** | 0.02 |
+| — mm_csv, CPU, parse only | 24.5 | 10.3 | 1.12 |
 
 **`small.csv`** — 23 MB, 255 361 rows, 8 columns, 2 042 888 fields:
 
@@ -170,8 +186,8 @@ it overlaps the read with the upload in 16 MiB slices.
 
 **The device work is small and scales well.** On the 253 MB document analyse
 and emit each read the whole thing at over 200 GiB/s and the two scans cost
-1.2 ms between them: 3.5 ms of kernels, against about 25 ms for the CPU
-library to parse the same shape. Add the upload and the index download and
+1.2 ms between them: 3.5 ms of kernels, against 24.4 ms for the CPU
+library to parse the same document. Add the upload and the index download and
 the device side is 5.3 ms.
 
 **Allocation was three quarters of the one-shot cost**, and reusing a scanner
