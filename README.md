@@ -167,6 +167,15 @@ region spanning chunks, a CRLF split across them, every tail alignment, and
 documents large enough to push the quote parity through all three levels of the
 prefix scan — within a block, across blocks, and across tiles of blocks.
 
+**They need a real GPU**, so they run here before a push rather than in CI.
+What CI does instead is compile the kernels for four architectures —
+`metal:4`, `metal:1`, `sm_80`, `gfx942` — through
+`mojo build --target-accelerator`, which names the target rather than asking
+the machine for one. Two of those nobody here owns. That is the check that
+matters: the one bug this library has had that no amount of host-side testing
+would find was `pack_bits` taking Metal's shader compiler down, and device
+codegen is the only thing that sees it.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

@@ -10,18 +10,27 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Hosted runners have no GPU, so the ten tests cannot run here -- they need a
+# real device and are run before every push (`pixi run test`, about a second).
+#
+# What CI *can* do is compile the kernels, which is where this library has
+# actually broken: `std.memory.pack_bits` took Metal's shader compiler down
+# with no diagnostic, and nothing but device codegen would have caught it.
+# `mojo build --target-accelerator` names the architecture rather than asking
+# the machine for one, so a runner with no GPU can still generate code for
+# four of them -- including two nobody here owns.
 jobs:
-  # The tests need a GPU, which hosted runners do not have. What CI can prove
-  # is that everything compiles for the host and that the kernels compile for
-  # the device, which is where this library has actually broken: `pack_bits`
-  # took Metal's shader compiler down with no diagnostic.
-  build:
-    name: build (${{ matrix.os }})
+  kernels:
+    name: kernels for ${{ matrix.accelerator }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - { os: macos-latest, accelerator: "metal:4" }
+          - { os: macos-latest, accelerator: "metal:1" }
+          - { os: ubuntu-latest, accelerator: "sm_80" }
+          - { os: ubuntu-latest, accelerator: "gfx942" }
     steps:
       - uses: actions/checkout@v7
 
@@ -29,23 +38,20 @@ jobs:
         with:
           cache: true
 
-      # Diagnostic: annotations are readable from the public API and logs
-      # are not. Whether a GPU-less runner can compile a target that launches
-      # kernels at all is the open question; this says what it says.
-      - name: Build the tests
-        id: buildtests
-        continue-on-error: true
+      # The test binary pulls in the whole library, so compiling it compiles
+      # every kernel. The output is echoed into an annotation as well as the
+      # log, because annotations are readable from the public API and logs
+      # are not.
+      - name: Compile the kernels
         shell: bash
         run: |
           set -o pipefail
-          if ! pixi run mojo build -I . test/test_csv_gpu.mojo \
-              -o "$RUNNER_TEMP/test_csv_gpu" 2>&1 | tee "$RUNNER_TEMP/b.log"; then
-            echo "::error title=build output::$(tail -c 1500 "$RUNNER_TEMP/b.log" | tr '\n%\r' '  ')"
+          if ! pixi run mojo build --target-accelerator='${{ matrix.accelerator }}' \
+              -I . test/test_csv_gpu.mojo -o "$RUNNER_TEMP/test_csv_gpu" \
+              2>&1 | tee "$RUNNER_TEMP/build.log"; then
+            echo "::error title=build output::$(tail -c 1500 "$RUNNER_TEMP/build.log" | tr '\n%\r' '  ')"
             exit 1
           fi
-
-      - name: Build the package, which needs no device
-        run: pixi build
 
   lint:
     name: format and docstrings
@@ -64,3 +70,36 @@ jobs:
 
       - name: Check docstrings
         run: pixi run docs
+
+  build:
+    name: build package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          # The pixi-build-mojo backend speaks pixi-build-api-version 7, which
+          # needs pixi >= 0.80. An older pixi does not fail on the version --
+          # it silently falls back to a 2025 backend that calls the removed
+          # `mojo package -o *.mojopkg`.
+          pixi-version: v0.80.0
+          cache: true
+
+      - name: Build the conda package
+        run: pixi build
+
+      - name: Check a package was produced
+        shell: bash
+        run: |
+          shopt -s nullglob
+          pkgs=(./*.conda)
+          if [ ${#pkgs[@]} -eq 0 ]; then
+            echo "pixi build produced no .conda package" >&2
+            exit 1
+          fi
+          ls -lh "${pkgs[@]}"
